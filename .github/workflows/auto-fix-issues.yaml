@@ -34,11 +34,16 @@ jobs:
         run: |
           mini-extra config set MSWEA_CONFIGURED 'true'
           mini-extra config set OPENAI_API_KEY '${{ secrets.OPENAI_API_KEY }}'
+          if [ -n "${{ secrets.OPENAI_API_BASE }}" ]; then
+            mini-extra config set OPENAI_API_BASE '${{ secrets.OPENAI_API_BASE }}'
+          fi
 
       - name: Fetch issue and run agent
         id: agent
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
         run: |
           # Fetch issue title and body
           ISSUE_CONTENT=$(gh issue view "${{ github.event.issue.number }}" \
@@ -48,8 +53,14 @@ jobs:
 
           echo "Running mini-swe-agent on issue #${{ github.event.issue.number }}..."
 
+          # Build model arg if MODEL_NAME secret is set
+          MODEL_ARG=""
+          if [ -n "${{ secrets.MODEL_NAME }}" ]; then
+            MODEL_ARG="-m ${{ secrets.MODEL_NAME }}"
+          fi
+
           # Run agent in yolo mode (no interactive prompts)
-          mini -y -t "$ISSUE_CONTENT" \
+          mini -y $MODEL_ARG -t "$ISSUE_CONTENT" \
             -o result.traj.json \
             2>&1 | tee agent_output.log || true
 
