@@ -53,14 +53,19 @@ jobs:
 
           echo "Running mini-swe-agent on issue #${{ github.event.issue.number }}..."
 
-          # Build model arg if MODEL_NAME secret is set
-          MODEL_ARG=""
-          if [ -n "${{ secrets.MODEL_NAME }}" ]; then
-            MODEL_ARG="-m ${{ secrets.MODEL_NAME }}"
+          # Determine model name
+          # litellm needs provider prefix like "openai/xxx" for OpenAI-compatible APIs
+          MODEL_NAME="${{ secrets.MODEL_NAME }}"
+          if [ -z "$MODEL_NAME" ]; then
+            MODEL_NAME="openai/gpt-4o"
+          fi
+          # Auto-add "openai/" prefix if using custom API base and no provider prefix
+          if [ -n "$OPENAI_API_BASE" ] && [[ "$MODEL_NAME" != */* ]]; then
+            MODEL_NAME="openai/$MODEL_NAME"
           fi
 
           # Run agent in yolo mode (no interactive prompts)
-          mini -y $MODEL_ARG -t "$ISSUE_CONTENT" \
+          mini -y -m "$MODEL_NAME" -t "$ISSUE_CONTENT" \
             -o result.traj.json \
             2>&1 | tee agent_output.log || true
 
