@@ -1,0 +1,305 @@
+name: Fix External Issue
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: 'Target repo (owner/repo), e.g. SWE-agent/mini-swe-agent'
+        required: true
+        type: string
+      issue_number:
+        description: 'Issue number in the target repo'
+        required: true
+        type: string
+      pr_target:
+        description: 'Where to create PR: "upstream" (directly in target repo, needs PAT) or "fork" (in your fork, then PR to upstream)'
+        required: true
+        type: choice
+        options:
+          - fork
+          - upstream
+
+concurrency:
+  group: fix-external-${{ inputs.target_repo }}-${{ inputs.issue_number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_REPO: ${{ inputs.target_repo }}
+      ISSUE_NUM: ${{ inputs.issue_number }}
+      # Use PAT if provided, otherwise fall back to GITHUB_TOKEN
+      GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Install mini-swe-agent
+        run: |
+          git clone https://github.com/${{ github.repository }}.git repo
+          cd repo
+          git checkout main
+          uv pip install --python ${Python_ROOT_DIR} -e '.[full]'
+
+      - name: Configure mini-swe-agent
+        run: |
+          cd repo
+          mini-extra config set MSWEA_CONFIGURED 'true'
+          mini-extra config set OPENAI_API_KEY '${{ secrets.OPENAI_API_KEY }}'
+          if [ -n "${{ secrets.OPENAI_API_BASE }}" ]; then
+            mini-extra config set OPENAI_API_BASE '${{ secrets.OPENAI_API_BASE }}'
+          fi
+
+      - name: Clone target repo
+        run: |
+          if [ "${{ inputs.pr_target }}" = "upstream" ]; then
+            # Clone target repo directly (needs write access via PAT)
+            git clone "https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPO}.git" target
+          else
+            # Fork workflow: check if fork exists, create if not
+            TARGET_OWNER=$(echo "$TARGET_REPO" | cut -d'/' -f1)
+            TARGET_NAME=$(echo "$TARGET_REPO" | cut -d'/' -f2)
+            FORK_OWNER=$(gh api user --jq '.login')
+            FORK_REPO="${FORK_OWNER}/${TARGET_NAME}"
+
+            # Check if fork exists
+            if ! gh repo view "$FORK_REPO" &>/dev/null; then
+              echo "Forking ${TARGET_REPO}..."
+              gh repo fork "$TARGET_REPO" --clone=false
+              sleep 5
+            fi
+
+            git clone "https://x-access-token:${GH_TOKEN}@github.com/${FORK_REPO}.git" target
+            cd target
+            # Add upstream remote for creating PRs
+            git remote add upstream "https://github.com/${TARGET_REPO}.git"
+            git fetch upstream
+          fi
+
+      - name: Fetch issue and run agent
+        id: agent
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
+          MSWEA_COST_TRACKING: ignore_errors
+        run: |
+          cd target
+
+          # Fetch issue from target repo
+          ISSUE_CONTENT=$(gh issue view "$ISSUE_NUM" \
+            --repo "$TARGET_REPO" \
+            --json title,body \
+            --jq '.title + "\n\n" + .body')
+
+          echo "Running mini-swe-agent on ${TARGET_REPO}#${ISSUE_NUM}..."
+
+          # Determine model name
+          MODEL_NAME="${{ secrets.MODEL_NAME }}"
+          if [ -z "$MODEL_NAME" ]; then
+            MODEL_NAME="openai/gpt-4o"
+          fi
+          if [ -n "$OPENAI_API_BASE" ] && [[ "$MODEL_NAME" != */* ]]; then
+            MODEL_NAME="openai/$MODEL_NAME"
+          fi
+
+          # Run agent
+          mini -y --exit-immediately -m "$MODEL_NAME" -t "$ISSUE_CONTENT" \
+            -o ../result.traj.json \
+            2>&1 | tee ../agent_output.log || true
+
+          cd ..
+          cd repo
+          # Check for changes in target dir
+          cd ../target
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No file changes detected."
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "File changes detected:"
+            git status --short
+          fi
+
+          # Extract summary
+          python3 << 'PYEOF'
+          import json
+          try:
+              data = json.load(open('../result.traj.json'))
+              info = data.get('info', {})
+              with open('../exit_status.txt', 'w') as f:
+                  f.write(info.get('exit_status', 'Unknown'))
+              summary_lines = []
+              for msg in data.get('messages', []):
+                  if msg.get('role') == 'assistant':
+                      content = msg.get('content', '')
+                      if content and isinstance(content, str) and content.strip():
+                          summary_lines.append(content.strip()[:500])
+              summary = "\n\n---\n\n".join(summary_lines[-5:])
+              if not summary:
+                  summary = "No agent reasoning captured."
+          except Exception as e:
+              summary = f"Failed to parse trajectory: {e}"
+              with open('../exit_status.txt', 'w') as f:
+                  f.write('Error')
+          with open('../agent_summary.md', 'w') as f:
+              f.write(summary)
+          PYEOF
+
+          echo "exit_status=$(cat ../exit_status.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Create PR (upstream)
+        if: steps.agent.outputs.has_changes == 'true' && inputs.pr_target == 'upstream'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          cd target
+          BRANCH_NAME="auto-fix/issue-${ISSUE_NUM}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "$BRANCH_NAME"
+          git add -A
+          git commit -m "fix: auto-fix for issue #${ISSUE_NUM}
+
+          Generated by mini-swe-agent"
+          git push --force origin "$BRANCH_NAME"
+
+          # Close existing PR
+          EXISTING_PR=$(gh pr list --repo "$TARGET_REPO" --head "$BRANCH_NAME" --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$EXISTING_PR" ]; then
+            gh pr close "$EXISTING_PR" --repo "$TARGET_REPO" || true
+          fi
+
+          PR_URL=$(gh pr create \
+            --repo "$TARGET_REPO" \
+            --title "Auto-fix: Issue #${ISSUE_NUM}" \
+            --body "$(cat <<EOF
+          ## 🤖 Automated fix for #${ISSUE_NUM}
+
+          This PR was generated by mini-swe-agent.
+
+          **Exit status:** \`${{ steps.agent.outputs.exit_status }}\`
+
+          ### Agent reasoning
+
+          $(cat ../agent_summary.md)
+
+          > Review the changes carefully before merging.
+          EOF
+          )" \
+            --base main \
+            --head "$BRANCH_NAME")
+
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+
+          gh issue comment "$ISSUE_NUM" \
+            --repo "$TARGET_REPO" \
+            --body "$(cat <<EOF
+          ## 🤖 mini-swe-agent completed
+
+          **Exit status:** \`${{ steps.agent.outputs.exit_status }}\`
+
+          **PR created:** $PR_URL
+
+          ### Agent reasoning
+
+          $(cat ../agent_summary.md)
+          EOF
+          )"
+
+      - name: Create PR (fork)
+        if: steps.agent.outputs.has_changes == 'true' && inputs.pr_target == 'fork'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          cd target
+          FORK_OWNER=$(gh api user --jq '.login')
+          BRANCH_NAME="auto-fix/issue-${ISSUE_NUM}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "$BRANCH_NAME"
+          git add -A
+          git commit -m "fix: auto-fix for issue #${ISSUE_NUM}
+
+          Generated by mini-swe-agent"
+          git push --force origin "$BRANCH_NAME"
+
+          # Create PR from fork to upstream
+          PR_URL=$(gh pr create \
+            --repo "$TARGET_REPO" \
+            --title "Auto-fix: Issue #${ISSUE_NUM}" \
+            --body "$(cat <<EOF
+          ## 🤖 Automated fix for #${ISSUE_NUM}
+
+          This PR was generated by mini-swe-agent from a fork.
+
+          **Exit status:** \`${{ steps.agent.outputs.exit_status }}\`
+
+          ### Agent reasoning
+
+          $(cat ../agent_summary.md)
+
+          > Review the changes carefully before merging.
+          EOF
+          )" \
+            --base main \
+            --head "${FORK_OWNER}:${BRANCH_NAME}")
+
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+
+          gh issue comment "$ISSUE_NUM" \
+            --repo "$TARGET_REPO" \
+            --body "$(cat <<EOF
+          ## 🤖 mini-swe-agent completed
+
+          **Exit status:** \`${{ steps.agent.outputs.exit_status }}\`
+
+          **PR created:** $PR_URL
+
+          ### Agent reasoning
+
+          $(cat ../agent_summary.md)
+          EOF
+          )"
+
+      - name: Comment on issue (no changes)
+        if: steps.agent.outputs.has_changes != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment "$ISSUE_NUM" \
+            --repo "$TARGET_REPO" \
+            --body "$(cat <<EOF
+          ## 🤖 mini-swe-agent completed
+
+          **Exit status:** \`${{ steps.agent.outputs.exit_status }}\`
+
+          No file changes were detected.
+
+          ### Agent reasoning
+
+          $(cat agent_summary.md 2>/dev/null || echo "N/A")
+          EOF
+          )"
+
+      - name: Upload trajectory artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trajectory-${{ inputs.target_repo }}-${{ inputs.issue_number }}
+          path: |
+            result.traj.json
+            agent_output.log
+          retention-days: 30
