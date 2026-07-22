@@ -98,6 +98,10 @@ jobs:
           ISSUE_NUM="${{ github.event.issue.number }}"
           BRANCH_NAME="auto-fix/issue-${ISSUE_NUM}"
 
+          # Configure git identity
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           # Create branch and commit
           git checkout -b "$BRANCH_NAME"
           git add -A
