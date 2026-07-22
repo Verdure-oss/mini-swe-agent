@@ -68,14 +68,14 @@ jobs:
             -o result.traj.json \
             2>&1 | tee agent_output.log || true
 
-          # Check for file changes made by the agent
-          if git diff --quiet && git diff --cached --quiet; then
+          # Check for any changes (modified, new, deleted files)
+          if [ -z "$(git status --porcelain)" ]; then
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
             echo "No file changes detected."
           else
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
             echo "File changes detected:"
-            git diff --stat
+            git status --short
           fi
 
           # Extract exit status and summary from trajectory
