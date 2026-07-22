@@ -1,0 +1,109 @@
+name: Auto Fix Issues
+
+on:
+  issues:
+    types: [labeled]
+
+concurrency:
+  group: fix-issue-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    if: github.event.label.name == 'auto-fix'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Install mini-swe-agent
+        run: uv pip install --python ${Python_ROOT_DIR} -e '.[full]'
+
+      - name: Configure mini-swe-agent
+        run: |
+          mini-extra config set MSWEA_CONFIGURED 'true'
+          mini-extra config set OPENAI_API_KEY '${{ secrets.OPENAI_API_KEY }}'
+
+      - name: Fetch issue and run agent
+        id: agent
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Fetch issue title and body
+          ISSUE_CONTENT=$(gh issue view "${{ github.event.issue.number }}" \
+            --repo "${{ github.repository }}" \
+            --json title,body \
+            --jq '.title + "\n\n" + .body')
+
+          echo "Running mini-swe-agent on issue #${{ github.event.issue.number }}..."
+
+          # Run agent in yolo mode (no interactive prompts)
+          mini -y -t "$ISSUE_CONTENT" \
+            -o result.traj.json \
+            2>&1 | tee agent_output.log || true
+
+          # Extract submission from trajectory
+          SUBMISSION=$(python3 -c "
+          import json, sys
+          try:
+              data = json.load(open('result.traj.json'))
+              print(data.get('info', {}).get('submission', 'No submission found'))
+          except Exception as e:
+              print(f'Failed to parse trajectory: {e}')
+          ")
+
+          # Save for next step
+          echo "submission<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$SUBMISSION" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Post result as issue comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" \
+            --repo "${{ github.repository }}" \
+            --body "## 🤖 mini-swe-agent Result
+
+          **Exit status from issue #${{ github.event.issue.number }}**
+
+          <details>
+          <summary>Agent submission</summary>
+
+          \`\`\`
+          ${{ steps.agent.outputs.submission }}
+          \`\`\`
+
+          </details>
+
+          > Trajectory file saved as workflow artifact for debugging."
+
+      - name: Upload trajectory artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trajectory-issue-${{ github.event.issue.number }}
+          path: |
+            result.traj.json
+            agent_output.log
+          retention-days: 30
+
+      - name: Remove auto-fix label
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue edit "${{ github.event.issue.number }}" \
+            --repo "${{ github.repository }}" \
+            --remove-label "auto-fix" || true
