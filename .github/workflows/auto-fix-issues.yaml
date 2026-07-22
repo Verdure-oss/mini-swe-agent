@@ -64,8 +64,8 @@ jobs:
             MODEL_NAME="openai/$MODEL_NAME"
           fi
 
-          # Run agent in yolo mode
-          mini -y -m "$MODEL_NAME" -t "$ISSUE_CONTENT" \
+          # Run agent in yolo mode, exit immediately without prompting
+          mini -y --exit-immediately -m "$MODEL_NAME" -t "$ISSUE_CONTENT" \
             -o result.traj.json \
             2>&1 | tee agent_output.log || true
 
