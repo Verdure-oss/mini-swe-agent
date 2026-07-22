@@ -44,6 +44,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
+          MSWEA_COST_TRACKING: ignore_errors
         run: |
           # Fetch issue title and body
           ISSUE_CONTENT=$(gh issue view "${{ github.event.issue.number }}" \
